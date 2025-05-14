@@ -1,0 +1,409 @@
+# DevOps Coding Assessment Solution
+
+## Overview
+This document provides a complete solution for the DevOps Coding Assessment, detailing the implementation of a Ruby on Rails application with a PostgreSQL database using Docker, Kubernetes, ArgoCD, and Tekton. The solution includes all required configuration files, setup instructions, and submission guidelines.
+
+---
+
+## Step 1: Docker
+### Description
+The Docker setup includes a `Dockerfile` to build a Ruby on Rails application and a `docker-compose.yml` to run the application and PostgreSQL database in separate containers.
+
+### Dockerfile
+```
+# Use official Ruby image with version 3.2
+FROM ruby:3.2
+
+# Install dependencies
+RUN apt-get update -qq && apt-get install -y nodejs postgresql-client
+
+# Set working directory
+WORKDIR /app
+
+# Copy Gemfile and install gems
+COPY Gemfile Gemfile.lock ./
+RUN bundle install
+
+# Copy the rest of the application
+COPY . .
+
+# Precompile assets
+RUN bundle exec rake assets:precompile
+
+# Expose port
+EXPOSE 3000
+
+# Start the Rails server
+CMD ["rails", "server", "-b", "0.0.0.0"]
+```
+
+### docker-compose.yml
+```
+version: '3.8'
+services:
+  db:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: rails_user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: rails_app_production
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+  web:
+    build: .
+    environment:
+      RAILS_ENV: production
+      DATABASE_URL: postgresql://rails_user:password@db:5432/rails_app_production
+    ports:
+      - "3000:3000"
+    depends_on:
+      - db
+volumes:
+  postgres_data:
+```
+
+### Usage
+1. Ensure a basic Rails app is present with `Gemfile` including `gem 'rails', '~> 7.0'` and `gem 'pg'`.
+2. Run `docker-compose up` to start the application.
+3. Access the app at http://localhost:3000.
+
+---
+
+## Step 2: Kubernetes
+### Description
+Kubernetes manifests deploy the Rails app as a `Deployment` and PostgreSQL as a `StatefulSet`, with an NGINX Ingress for external access. Secrets store sensitive data.
+
+### rails-app-deployment.yaml
+```
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rails-app
+  namespace: default
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: rails-app
+  template:
+    metadata:
+      labels:
+        app: rails-app
+    spec:
+      containers:
+      - name: rails-app
+        image: <your-dockerhub-username>/rails-app:latest
+        ports:
+        - containerPort: 3000
+        env:
+        - name: RAILS_ENV
+          value: "production"
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: rails-app-secrets
+              key: database-url
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rails-app-service
+  namespace: default
+spec:
+  selector:
+    app: rails-app
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 3000
+  type: ClusterIP
+```
+
+### postgres-statefulset.yaml
+```
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: default
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:15
+        env:
+        - name: POSTGRES_USER
+          value: rails_user
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: postgres-secrets
+              key: postgres-password
+        - name: POSTGRES_DB
+          value: rails_app_production
+        ports:
+        - containerPort: 5432
+        volumeMounts:
+        - name: postgres-data
+          mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+  - metadata:
+      name: postgres-data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-service
+  namespace: default
+spec:
+  selector:
+    app: postgres
+  ports:
+  - protocol: TCP
+    port: 5432
+    targetPort: 5432
+  type: ClusterIP
+```
+
+### ingress.yaml
+```
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: rails-app-ingress
+  namespace: default
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: rails-app.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: rails-app-service
+            port:
+              number: 80
+```
+
+### secrets.yaml
+```
+apiVersion: v1
+kind: Secret
+metadata:
+  name: rails-app-secrets
+  namespace: default
+type: Opaque
+data:
+  database-url: cG9zdGdyZXNxbDovL3JhaWxzX3VzZXI6cGFzc3dvcmRAcG9zdGdyZXMtc2VydmljZTo1NDMyL3JhaWxzX2FwcF9wcm9kdWN0aW9u
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgres-secrets
+  namespace: default
+type: Opaque
+data:
+  postgres-password: cGFzc3dvcmQ=
+```
+
+### Setup
+1. Start Minikube: `minikube start`.
+2. Install NGINX Ingress: `kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml`.
+3. Apply manifests: `kubectl apply -f k8s-manifests/`.
+4. Update `/etc/hosts` to map `rails-app.local` to Minikube IP.
+5. Access the app at http://rails-app.local.
+
+---
+
+## Step 3: ArgoCD
+### Description
+ArgoCD manages the Kubernetes deployment using GitOps, with configurations stored in a private GitHub repository (`rails-app-gitops`).
+
+### application.yaml
+```
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: rails-app
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/<your-username>/rails-app-gitops.git
+    targetRevision: main
+    path: k8s-manifests
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: default
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+```
+
+### argocd-cm.yaml
+```
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-cm
+  namespace: argocd
+data:
+  repositories: |
+    - url: https://github.com/<your-username>/rails-app-gitops.git
+      type: git
+      passwordSecret:
+        name: github-creds
+        key: password
+      username: <your-username>
+```
+
+### argocd-rbac-cm.yaml
+```
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-rbac-cm
+  namespace: argocd
+data:
+  policy.default: role:readonly
+```
+
+### github-creds.yaml
+```
+apiVersion: v1
+kind: Secret
+metadata:
+  name: github-creds
+  namespace: argocd
+type: Opaque
+data:
+  password: <base64-encoded-github-pat>
+```
+
+### Setup
+1. Install ArgoCD: `kubectl create namespace argocd && kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml`.
+2. Apply configurations: `kubectl apply -f argocd/`.
+3. Access ArgoCD UI: `kubectl port-forward svc/argocd-server -n argocd 8080:443`.
+4. Verify application sync status in the UI.
+
+**Note**: Replace `<your-username>` and `<base64-encoded-github-pat>` with your GitHub username and base64-encoded Personal Access Token.
+
+---
+
+## Step 4: Tekton
+### Description
+A Tekton pipeline clones the Rails app source, builds the Docker image using Kaniko, and pushes it to Docker Hub. The pipeline is triggered via the Tekton Dashboard.
+
+### pipeline.yaml
+```
+apiVersion: tekton.dev/v1beta1
+kind: Pipeline
+metadata:
+  name: rails-app-build
+  namespace: tekton-pipelines
+spec:
+  tasks:
+  - name: clone
+    taskRef:
+      name: git-clone
+    params:
+    - name: url
+      value: https://github.com/<your-username>/rails-app.git
+    - name: revision
+      value: main
+    workspaces:
+    - name: output
+      workspace: shared-workspace
+  - name: build-and-push
+    taskRef:
+      name: kaniko
+    runAfter:
+    - clone
+    params:
+    - name: IMAGE
+      value: docker.io/<your-dockerhub-username>/rails-app:latest
+    - name: DOCKERFILE
+      value: ./Dockerfile
+    workspaces:
+    - name: source
+      workspace: shared-workspace
+  workspaces:
+  - name: shared-workspace
+```
+
+### pipelinerun.yaml
+```
+apiVersion: tekton.dev/v1beta1
+kind: PipelineRun
+metadata:
+  generateName: rails-app-build-run-
+  namespace: tekton-pipelines
+spec:
+  pipelineRef:
+    name: rails-app-build
+  workspaces:
+  - name: shared-workspace
+    persistentVolumeClaim:
+      claimName: tekton-pvc
+  - name: docker-credentials
+    secret:
+      secretName: docker-credentials
+```
+
+### pvc.yaml
+```
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: tekton-pvc
+  namespace: tekton-pipelines
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+```
+
+### docker-credentials.yaml
+```
+apiVersion: v1
+kind: Secret
+metadata:
+  name: docker-credentials
+  namespace: tekton-pipelines
+type: kubernetes.io/dockerconfigjson
+data:
+  .dockerconfigjson: <base64-encoded-docker-config>
+```
+
+### Setup
+1. Install Tekton: `kubectl apply -f https://storage.googleapis.com/tekton-releases/pipeline/latest/release.yaml`.
+2. Install Tekton Dashboard: `kubectl apply -f https://storage.googleapis.com/tekton-releases/dashboard/latest/release.yaml`.
+3. Install tasks: `kubectl apply -f https://raw.githubusercontent.com/tektoncd/catalog/main/task/git-clone/0.9/git-clone.yaml` and `kubectl apply -f https://raw.githubusercontent.com/tektoncd/catalog/main/task/kaniko/0.6/kaniko.yaml`.
+4. Create Docker credentials: `kubectl create secret docker-registry docker-credentials --docker-username=<username> --docker-password=<password> -n tekton-pipelines`.
+5. Apply pipeline and PVC: `kubectl apply -f tekton/`.
+6. Access the Tekton Dashboard (http://<dashboard-url>) or run `kubectl apply -f tekton/pipelinerun.yaml` to trigger the pipeline.
+
+**Note**: Replace `<your-username>` and `<your-dockerhub-username>` with your GitHub and Docker Hub usernames. Provide the base64-encoded Docker config.
