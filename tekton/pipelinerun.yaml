@@ -1,0 +1,16 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: PipelineRun
+metadata:
+  generateName: rails-app-build-run-
+  namespace: tekton-pipelines
+spec:
+  pipelineRef:
+    name: rails-app-build
+  workspaces:
+  - name: shared-workspace
+    persistentVolumeClaim:
+      claimName: tekton-pvc
+  - name: docker-credentials
+    secret:
+      secretName: docker-credentials

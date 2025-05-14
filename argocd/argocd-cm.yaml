@@ -1,0 +1,14 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-cm
+  namespace: argocd
+data:
+  repositories: |
+    - url: https://github.com/<your-username>/rails-app-gitops.git
+      type: git
+      passwordSecret:
+        name: github-creds
+        key: password
+      username: <your-username>
